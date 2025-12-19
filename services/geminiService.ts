@@ -72,9 +72,13 @@ export class GeminiLiveTranslator {
     const isAutoDetect = sourceLang === 'Auto-detect';
     
     const systemInstruction = `
-      You are a world-class real-time classroom translator.
+      You are a world-class real-time classroom translator with vision capabilities.
       ${isAutoDetect ? "Detect the speaker's language automatically." : `The speaker is using ${sourceLang}.`}
       Translate all spoken input into ${targetLang}.
+      
+      VISION CAPABILITIES:
+      If image frames are sent, use them as context for your translation. 
+      For example, if you see a slide about "Quantum Physics", ensure your terminology matches.
       
       CRITICAL RULES:
       1. Output ONLY the final translated text. 
@@ -149,6 +153,15 @@ export class GeminiLiveTranslator {
     };
     try {
       this.session.sendRealtimeInput({ media: pcmBlob });
+    } catch (e) {}
+  }
+
+  sendVideoFrame(base64Data: string) {
+    if (!this.session) return;
+    try {
+      this.session.sendRealtimeInput({
+        media: { data: base64Data, mimeType: 'image/jpeg' }
+      });
     } catch (e) {}
   }
 

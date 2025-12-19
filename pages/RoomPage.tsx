@@ -44,12 +44,18 @@ const RoomPage: React.FC<RoomPageProps> = ({
     listeningLanguage: targetLang.name
   };
 
-  const [participants, setParticipants] = useState<Participant[]>([initialMe]);
-  const participantsRef = useRef<Participant[]>([initialMe]);
+  // Mock participants for demonstration
+  const [participants, setParticipants] = useState<Participant[]>([
+    initialMe,
+    { id: 'p1', name: 'Jean-Luc', role: Role.STUDENT, isMuted: true, isVideoOn: false, handRaised: false, speakingLanguage: 'French', listeningLanguage: 'English' },
+    { id: 'p2', name: 'Elena', role: Role.CO_HOST, isMuted: false, isVideoOn: false, handRaised: false, speakingLanguage: 'Russian', listeningLanguage: 'English' }
+  ]);
+  const participantsRef = useRef<Participant[]>(participants);
   const [transcripts, setTranscripts] = useState<TranscriptChunk[]>([]);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isMuted, setIsMuted] = useState(false);
   const [isVideoOn, setIsVideoOn] = useState(true);
+  const [isHandRaised, setIsHandRaised] = useState(false);
   const [isSharingScreen, setIsSharingScreen] = useState(false);
   const [isSharingAudio, setIsSharingAudio] = useState(true);
   const [activeTab, setActiveTab] = useState<'participants' | 'chat'>('participants');
@@ -58,6 +64,8 @@ const RoomPage: React.FC<RoomPageProps> = ({
   const [audioLevel, setAudioLevel] = useState(0);
   
   const translatorRef = useRef<GeminiLiveTranslator | null>(null);
+  const captureCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const captureIntervalRef = useRef<number | null>(null);
   
   // Audio Pipeline Refs
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -66,64 +74,62 @@ const RoomPage: React.FC<RoomPageProps> = ({
   const micSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const screenAudioSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
+  const screenStreamRef = useRef<MediaStream | null>(null);
   
   const isDuckingRef = useRef(false);
   const currentSpeechSourceId = useRef<string>('me');
-  const screenStreamRef = useRef<MediaStream | null>(null);
   const sessionId = useRef(`session-${Date.now()}`);
 
   useEffect(() => {
     participantsRef.current = participants;
   }, [participants]);
 
-  // Unified Audio Cleanup
   const cleanupAudio = useCallback(() => {
-    if (scriptProcessorRef.current) {
-      scriptProcessorRef.current.disconnect();
-      scriptProcessorRef.current = null;
-    }
-    if (micSourceRef.current) {
-      micSourceRef.current.disconnect();
-      micSourceRef.current = null;
-    }
-    if (screenAudioSourceRef.current) {
-      screenAudioSourceRef.current.disconnect();
-      screenAudioSourceRef.current = null;
-    }
-    if (analyserRef.current) {
-      analyserRef.current.disconnect();
-      analyserRef.current = null;
-    }
-    if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
-      audioContextRef.current.close();
-      audioContextRef.current = null;
-    }
-    if (micStreamRef.current) {
-      micStreamRef.current.getTracks().forEach(t => t.stop());
-      micStreamRef.current = null;
-    }
+    if (scriptProcessorRef.current) scriptProcessorRef.current.disconnect();
+    if (micSourceRef.current) micSourceRef.current.disconnect();
+    if (screenAudioSourceRef.current) screenAudioSourceRef.current.disconnect();
+    if (analyserRef.current) analyserRef.current.disconnect();
+    if (audioContextRef.current && audioContextRef.current.state !== 'closed') audioContextRef.current.close();
+    if (micStreamRef.current) micStreamRef.current.getTracks().forEach(t => t.stop());
+    if (screenStreamRef.current) screenStreamRef.current.getTracks().forEach(t => t.stop());
+    if (captureIntervalRef.current) clearInterval(captureIntervalRef.current);
+  }, []);
+
+  const startVisionCapture = useCallback((stream: MediaStream) => {
+    if (captureIntervalRef.current) clearInterval(captureIntervalRef.current);
+    
+    const video = document.createElement('video');
+    video.srcObject = stream;
+    video.play();
+    
+    const canvas = captureCanvasRef.current || document.createElement('canvas');
+    captureCanvasRef.current = canvas;
+    const ctx = canvas.getContext('2d');
+
+    captureIntervalRef.current = window.setInterval(() => {
+      if (!ctx || !video.videoWidth) return;
+      canvas.width = 640;
+      canvas.height = 360;
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const base64Data = canvas.toDataURL('image/jpeg', 0.6).split(',')[1];
+      translatorRef.current?.sendVideoFrame(base64Data);
+    }, 2000); // 2 seconds interval for AI context
   }, []);
 
   const startSession = useCallback(async () => {
-    if (translatorRef.current) {
-      translatorRef.current.close();
-    }
+    if (translatorRef.current) translatorRef.current.close();
     
     const translator = new GeminiLiveTranslator();
     translatorRef.current = translator;
 
     try {
-      // Initialize Context if not exists
       if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
         audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: AUDIO_SAMPLE_RATE });
-        
         const analyser = audioContextRef.current.createAnalyser();
         analyser.fftSize = 256;
         analyserRef.current = analyser;
-
         const scriptProcessor = audioContextRef.current.createScriptProcessor(4096, 1, 1);
         scriptProcessorRef.current = scriptProcessor;
-
         const dataArray = new Uint8Array(analyser.frequencyBinCount);
         const updateVisualizer = () => {
           if (analyserRef.current && audioContextRef.current?.state !== 'closed') {
@@ -134,25 +140,22 @@ const RoomPage: React.FC<RoomPageProps> = ({
           }
         };
         updateVisualizer();
-
         scriptProcessor.onaudioprocess = (e) => {
           if (isDuckingRef.current || isMuted) return;
           const inputData = e.inputBuffer.getChannelData(0);
           translatorRef.current?.sendAudio(inputData);
         };
-
-        // Base pipeline connection
         analyser.connect(scriptProcessor);
         scriptProcessor.connect(audioContextRef.current.destination);
       }
 
-      // Initialize Mic Source
       if (!micSourceRef.current) {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
         micStreamRef.current = stream;
         const source = audioContextRef.current.createMediaStreamSource(stream);
         micSourceRef.current = source;
         source.connect(analyserRef.current!);
+        if (isVideoOn) startVisionCapture(stream);
       }
 
       await translator.connect({
@@ -164,52 +167,27 @@ const RoomPage: React.FC<RoomPageProps> = ({
           const sourceId = currentSpeechSourceId.current;
           const curParticipants = participantsRef.current;
           const speaker = curParticipants.find(p => p.id === sourceId) || curParticipants[0];
-          
           if (!speaker) return;
-          
-          // Clean text from internal tags if any leak
           const cleanText = text.replace(/\[.*?\]/g, '').trim();
           if (!cleanText) return;
-
           setActiveSpeakerId(sourceId);
-
           setTranscripts(prev => {
             const last = prev[prev.length - 1];
             const now = Date.now();
-            
             if (isModel) {
               if (last && last.participantId === sourceId && (!last.translatedText || last.translatedText === '...')) {
                 const updated = [...prev];
                 updated[updated.length - 1] = { ...last, translatedText: cleanText };
-                
-                saveTranscriptToSupabase({
-                  session_id: sessionId.current,
-                  speaker_name: speaker.name,
-                  speaker_role: speaker.role,
-                  original_text: last.originalText,
-                  translated_text: cleanText,
-                  timestamp: new Date(now).toISOString()
-                });
-
+                saveTranscriptToSupabase({ session_id: sessionId.current, speaker_name: speaker.name, speaker_role: speaker.role, original_text: last.originalText, translated_text: cleanText, timestamp: new Date(now).toISOString() });
                 return updated;
               }
             } else {
-              // Append to last if within 4s and same speaker
               if (last && last.participantId === sourceId && now - last.timestamp < 4000 && !last.translatedText) {
                  const updated = [...prev];
                  updated[updated.length - 1] = { ...last, originalText: last.originalText + ' ' + cleanText };
                  return updated;
               }
-              // Create new chunk with current speaker identity
-              return [...prev, { 
-                id: now.toString(), 
-                participantId: speaker.id, 
-                participantName: speaker.name, 
-                participantRole: speaker.role, 
-                originalText: cleanText, 
-                translatedText: '', 
-                timestamp: now 
-              }];
+              return [...prev, { id: now.toString(), participantId: speaker.id, participantName: speaker.name, participantRole: speaker.role, originalText: cleanText, translatedText: '', timestamp: now }];
             }
             return prev;
           });
@@ -229,7 +207,7 @@ const RoomPage: React.FC<RoomPageProps> = ({
     } catch (err) {
       console.error('Session establishment failed:', err);
     }
-  }, [sourceLang.name, targetLang.name, voiceName, isMuted]);
+  }, [sourceLang.name, targetLang.name, voiceName, isMuted, isVideoOn, startVisionCapture]);
 
   useEffect(() => {
     startSession();
@@ -239,35 +217,18 @@ const RoomPage: React.FC<RoomPageProps> = ({
     };
   }, [startSession, cleanupAudio]);
 
-  const handleLeave = () => {
-    onExit(transcripts);
-    cleanupAudio();
-    navigate('/transcript');
-  };
-  
   const toggleShareScreen = async () => {
     if (!isSharingScreen) {
       try {
-        const stream = await navigator.mediaDevices.getDisplayMedia({ 
-          video: { cursor: "always" },
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            sampleRate: AUDIO_SAMPLE_RATE
-          }
-        } as any);
-        
+        const stream = await navigator.mediaDevices.getDisplayMedia({ video: { cursor: "always" }, audio: { echoCancellation: true, noiseSuppression: true, sampleRate: AUDIO_SAMPLE_RATE } } as any);
         screenStreamRef.current = stream;
-
         if (stream.getAudioTracks().length > 0 && audioContextRef.current && analyserRef.current) {
           const screenAudioSource = audioContextRef.current.createMediaStreamSource(stream);
           screenAudioSourceRef.current = screenAudioSource;
           screenAudioSource.connect(analyserRef.current);
         }
-
-        stream.getVideoTracks()[0].onended = () => {
-          stopScreenShare();
-        };
+        startVisionCapture(stream);
+        stream.getVideoTracks()[0].onended = () => stopScreenShare();
         setIsSharingScreen(true);
       } catch (e: any) {
         console.warn('Screen share failed:', e);
@@ -285,6 +246,20 @@ const RoomPage: React.FC<RoomPageProps> = ({
     screenStreamRef.current?.getTracks().forEach(track => track.stop());
     screenStreamRef.current = null;
     setIsSharingScreen(false);
+    if (isVideoOn && micStreamRef.current) startVisionCapture(micStreamRef.current);
+  };
+
+  const handleToggleHand = () => {
+    const nextState = !isHandRaised;
+    setIsHandRaised(nextState);
+    setParticipants(prev => prev.map(p => p.id === 'me' ? { ...p, handRaised: nextState } : p));
+  };
+
+  const handleTeacherAction = (action: string) => {
+    if (role !== Role.TEACHER) return;
+    if (action === 'muteAll') {
+      setParticipants(prev => prev.map(p => p.id === 'me' ? p : { ...p, isMuted: true }));
+    }
   };
 
   return (
@@ -298,6 +273,8 @@ const RoomPage: React.FC<RoomPageProps> = ({
             isSharingScreen={isSharingScreen}
             activeSpeakerId={activeSpeakerId}
             audioLevel={audioLevel}
+            localVideoStream={micStreamRef.current}
+            screenStream={screenStreamRef.current}
           />
           
           {showCaptions && (
@@ -308,7 +285,7 @@ const RoomPage: React.FC<RoomPageProps> = ({
         </div>
 
         {isSidebarOpen && (
-          <div className="w-80 h-full border-l border-white/10 bg-zinc-950 flex flex-col transition-all animate-fadeIn shrink-0">
+          <div className="w-80 h-full border-l border-white/5 bg-zinc-950 flex flex-col transition-all animate-fadeIn shrink-0">
             <SidePanel 
               activeTab={activeTab} 
               onTabChange={setActiveTab} 
@@ -317,6 +294,7 @@ const RoomPage: React.FC<RoomPageProps> = ({
               onSendMessage={(text) => setMessages(prev => [...prev, { id: Date.now().toString(), senderId: 'me', senderName: userName, text, timestamp: Date.now() }])}
               onClose={() => setIsSidebarOpen(false)}
               activeSpeakerId={activeSpeakerId}
+              teacherControls={role === Role.TEACHER ? { onMuteAll: () => handleTeacherAction('muteAll') } : undefined}
             />
           </div>
         )}
@@ -327,11 +305,13 @@ const RoomPage: React.FC<RoomPageProps> = ({
         isVideoOn={isVideoOn}
         isSharingScreen={isSharingScreen}
         isSharingAudio={isSharingAudio}
+        isHandRaised={isHandRaised}
+        onToggleHand={handleToggleHand}
         onToggleAudioShare={() => setIsSharingAudio(!isSharingAudio)}
         onMute={() => setIsMuted(!isMuted)}
         onVideo={() => setIsVideoOn(!isVideoOn)}
         onShareScreen={toggleShareScreen}
-        onLeave={handleLeave}
+        onLeave={() => { onExit(transcripts); cleanupAudio(); navigate('/transcript'); }}
         role={role}
         isDarkMode={isDarkMode}
         toggleDarkMode={toggleDarkMode}
