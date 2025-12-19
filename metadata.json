@@ -1,0 +1,9 @@
+{
+  "name": "Eburon Class Session Translator",
+  "description": "A Zoom-like real-time classroom application with built-in Gemini-powered live audio translation, captions, and role-based controls.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone",
+    "display-capture"
+  ]
+}
