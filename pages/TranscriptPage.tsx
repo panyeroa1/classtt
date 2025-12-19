@@ -15,12 +15,14 @@ const TranscriptPage: React.FC<TranscriptPageProps> = ({ transcripts, isDarkMode
   const handleExport = (format: 'txt' | 'json') => {
     let content = '';
     if (format === 'txt') {
-      content = `EBURON CLASS SESSION TRANSCRIPT\nGenerated on: ${new Date().toLocaleString()}\n==========================================\n\n`;
+      content = `EBURON CLASS SESSION TRANSCRIPT\nGenerated: ${new Date().toLocaleString()}\nSession Hash: ${Date.now().toString(16).toUpperCase()}\n------------------------------------------\n\n`;
+      
       content += transcripts.map(t => {
-        const timestamp = new Date(t.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-        // Professional header format: SPEAKER NAME (ROLE) | TIMESTAMP
-        const header = `${t.participantName.toUpperCase()} [${t.participantRole.toUpperCase()}] | ${timestamp}`;
-        return `${header}\n${'-'.repeat(header.length)}\nORIGINAL: ${t.originalText}\nTRANSLATION: ${t.translatedText || '...'}\n\n`;
+        const time = new Date(t.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        const speakerIdLine = `[${time}] ${t.participantName.toUpperCase()} (${t.participantRole.toUpperCase()})`;
+        const separator = "-".repeat(speakerIdLine.length);
+        
+        return `${speakerIdLine}\n${separator}\nORIGINAL: ${t.originalText}\nTRANSLATED: ${t.translatedText || '...'}\n\n`;
       }).join('\n');
     } else {
       content = JSON.stringify(transcripts, null, 2);
@@ -119,16 +121,16 @@ const TranscriptPage: React.FC<TranscriptPageProps> = ({ transcripts, isDarkMode
                        <svg width="60" height="60" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
                     </div>
                     <div className="space-y-3">
-                      <span className="text-[10px] font-black text-slate-400 dark:text-zinc-600 uppercase tracking-widest">Raw Input</span>
+                      <span className="text-[10px] font-black text-slate-400 dark:text-zinc-600 uppercase tracking-widest">Input Phrase</span>
                       <p className="text-slate-600 dark:text-zinc-400 text-xl leading-relaxed font-bold italic opacity-80">
                         "{t.originalText}"
                       </p>
                     </div>
                     <div className="h-[2px] bg-slate-100 dark:bg-zinc-800 w-full"></div>
                     <div className="space-y-3">
-                      <span className="text-[10px] font-black text-emerald-500 uppercase tracking-widest">Optimized Translation</span>
+                      <span className="text-[10px] font-black text-emerald-500 uppercase tracking-widest">Acoustic Translation</span>
                       <p className="text-slate-900 dark:text-zinc-100 text-3xl font-black tracking-tight leading-tight">
-                        {t.translatedText || "Decoding..."}
+                        {t.translatedText || "Decoding signal..."}
                       </p>
                     </div>
                   </div>

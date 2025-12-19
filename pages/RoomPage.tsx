@@ -58,8 +58,15 @@ const RoomPage: React.FC<RoomPageProps> = ({
   const [audioLevel, setAudioLevel] = useState(0);
   
   const translatorRef = useRef<GeminiLiveTranslator | null>(null);
-  const inputAudioContextRef = useRef<AudioContext | null>(null);
+  
+  // Audio Pipeline Refs
+  const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
+  const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const micSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const screenAudioSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const micStreamRef = useRef<MediaStream | null>(null);
+  
   const isDuckingRef = useRef(false);
   const currentSpeechSourceId = useRef<string>('me');
   const screenStreamRef = useRef<MediaStream | null>(null);
@@ -68,6 +75,34 @@ const RoomPage: React.FC<RoomPageProps> = ({
   useEffect(() => {
     participantsRef.current = participants;
   }, [participants]);
+
+  // Unified Audio Cleanup
+  const cleanupAudio = useCallback(() => {
+    if (scriptProcessorRef.current) {
+      scriptProcessorRef.current.disconnect();
+      scriptProcessorRef.current = null;
+    }
+    if (micSourceRef.current) {
+      micSourceRef.current.disconnect();
+      micSourceRef.current = null;
+    }
+    if (screenAudioSourceRef.current) {
+      screenAudioSourceRef.current.disconnect();
+      screenAudioSourceRef.current = null;
+    }
+    if (analyserRef.current) {
+      analyserRef.current.disconnect();
+      analyserRef.current = null;
+    }
+    if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+      audioContextRef.current.close();
+      audioContextRef.current = null;
+    }
+    if (micStreamRef.current) {
+      micStreamRef.current.getTracks().forEach(t => t.stop());
+      micStreamRef.current = null;
+    }
+  }, []);
 
   const startSession = useCallback(async () => {
     if (translatorRef.current) {
@@ -78,21 +113,20 @@ const RoomPage: React.FC<RoomPageProps> = ({
     translatorRef.current = translator;
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      if (!inputAudioContextRef.current || inputAudioContextRef.current.state === 'closed') {
-        const ctx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: AUDIO_SAMPLE_RATE });
-        inputAudioContextRef.current = ctx;
-
-        const analyser = ctx.createAnalyser();
+      // Initialize Context if not exists
+      if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
+        audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: AUDIO_SAMPLE_RATE });
+        
+        const analyser = audioContextRef.current.createAnalyser();
         analyser.fftSize = 256;
         analyserRef.current = analyser;
 
-        const source = ctx.createMediaStreamSource(stream);
-        const scriptProcessor = ctx.createScriptProcessor(4096, 1, 1);
+        const scriptProcessor = audioContextRef.current.createScriptProcessor(4096, 1, 1);
+        scriptProcessorRef.current = scriptProcessor;
 
         const dataArray = new Uint8Array(analyser.frequencyBinCount);
         const updateVisualizer = () => {
-          if (analyserRef.current && inputAudioContextRef.current?.state !== 'closed') {
+          if (analyserRef.current && audioContextRef.current?.state !== 'closed') {
             analyserRef.current.getByteFrequencyData(dataArray);
             const average = dataArray.reduce((a, b) => a + b) / dataArray.length;
             setAudioLevel(average / 128);
@@ -107,9 +141,18 @@ const RoomPage: React.FC<RoomPageProps> = ({
           translatorRef.current?.sendAudio(inputData);
         };
 
-        source.connect(analyser);
-        source.connect(scriptProcessor);
-        scriptProcessor.connect(ctx.destination);
+        // Base pipeline connection
+        analyser.connect(scriptProcessor);
+        scriptProcessor.connect(audioContextRef.current.destination);
+      }
+
+      // Initialize Mic Source
+      if (!micSourceRef.current) {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        micStreamRef.current = stream;
+        const source = audioContextRef.current.createMediaStreamSource(stream);
+        micSourceRef.current = source;
+        source.connect(analyserRef.current!);
       }
 
       await translator.connect({
@@ -123,45 +166,47 @@ const RoomPage: React.FC<RoomPageProps> = ({
           const speaker = curParticipants.find(p => p.id === sourceId) || curParticipants[0];
           
           if (!speaker) return;
-          if (text.trim().length > 0) setActiveSpeakerId(sourceId);
+          
+          // Clean text from internal tags if any leak
+          const cleanText = text.replace(/\[.*?\]/g, '').trim();
+          if (!cleanText) return;
+
+          setActiveSpeakerId(sourceId);
 
           setTranscripts(prev => {
             const last = prev[prev.length - 1];
             const now = Date.now();
             
             if (isModel) {
-              // Handle translation result from AI
               if (last && last.participantId === sourceId && (!last.translatedText || last.translatedText === '...')) {
                 const updated = [...prev];
-                updated[updated.length - 1] = { ...last, translatedText: text };
+                updated[updated.length - 1] = { ...last, translatedText: cleanText };
                 
-                // Sync to external repository with full speaker metadata
                 saveTranscriptToSupabase({
                   session_id: sessionId.current,
                   speaker_name: speaker.name,
                   speaker_role: speaker.role,
                   original_text: last.originalText,
-                  translated_text: text,
+                  translated_text: cleanText,
                   timestamp: new Date(now).toISOString()
                 });
 
                 return updated;
               }
             } else {
-              // Handle original transcription from user
-              // If the speaker is the same and time gap is small, append to the current chunk
+              // Append to last if within 4s and same speaker
               if (last && last.participantId === sourceId && now - last.timestamp < 4000 && !last.translatedText) {
                  const updated = [...prev];
-                 updated[updated.length - 1] = { ...last, originalText: last.originalText + ' ' + text };
+                 updated[updated.length - 1] = { ...last, originalText: last.originalText + ' ' + cleanText };
                  return updated;
               }
-              // Create a new distinct transcript chunk
+              // Create new chunk with current speaker identity
               return [...prev, { 
                 id: now.toString(), 
                 participantId: speaker.id, 
                 participantName: speaker.name, 
                 participantRole: speaker.role, 
-                originalText: text, 
+                originalText: cleanText, 
                 translatedText: '', 
                 timestamp: now 
               }];
@@ -190,11 +235,13 @@ const RoomPage: React.FC<RoomPageProps> = ({
     startSession();
     return () => {
       translatorRef.current?.close();
+      cleanupAudio();
     };
-  }, [startSession]);
+  }, [startSession, cleanupAudio]);
 
   const handleLeave = () => {
     onExit(transcripts);
+    cleanupAudio();
     navigate('/transcript');
   };
   
@@ -202,23 +249,42 @@ const RoomPage: React.FC<RoomPageProps> = ({
     if (!isSharingScreen) {
       try {
         const stream = await navigator.mediaDevices.getDisplayMedia({ 
-          video: true,
-          audio: isSharingAudio
-        });
+          video: { cursor: "always" },
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            sampleRate: AUDIO_SAMPLE_RATE
+          }
+        } as any);
+        
         screenStreamRef.current = stream;
+
+        if (stream.getAudioTracks().length > 0 && audioContextRef.current && analyserRef.current) {
+          const screenAudioSource = audioContextRef.current.createMediaStreamSource(stream);
+          screenAudioSourceRef.current = screenAudioSource;
+          screenAudioSource.connect(analyserRef.current);
+        }
+
         stream.getVideoTracks()[0].onended = () => {
-          setIsSharingScreen(false);
-          screenStreamRef.current = null;
+          stopScreenShare();
         };
         setIsSharingScreen(true);
       } catch (e: any) {
         console.warn('Screen share failed:', e);
       }
     } else {
-      screenStreamRef.current?.getTracks().forEach(track => track.stop());
-      screenStreamRef.current = null;
-      setIsSharingScreen(false);
+      stopScreenShare();
     }
+  };
+
+  const stopScreenShare = () => {
+    if (screenAudioSourceRef.current) {
+      screenAudioSourceRef.current.disconnect();
+      screenAudioSourceRef.current = null;
+    }
+    screenStreamRef.current?.getTracks().forEach(track => track.stop());
+    screenStreamRef.current = null;
+    setIsSharingScreen(false);
   };
 
   return (
